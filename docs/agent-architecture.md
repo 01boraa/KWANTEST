@@ -180,11 +180,147 @@ src/
     image_api.py              # E가 사용
     wordpress_client.py        # H가 사용 (블로그)
     instagram_client.py        # H가 사용 (카드뉴스)
+  prompts/
+    collector.md              # A
+    verifier.md                # B
+    writer.md                   # C
+    editor.md                    # D
+    image_generator.md            # E
+    alignment_validator.md         # F
+    supervisor.md                   # G
+    _shared/
+      style_guide_block.md         # 여러 프롬프트가 공유하는 브랜드 톤/컬러 블록
 docs/
   agent-architecture.md    # 본 문서
 ```
 
-## 6. 다음 단계 (구현 시 고려사항)
+## 6. 에이전트 지침(프롬프트) 설계 방식
+
+그래프 구조·상태 스키마·재시도 로직은 결정론적인 "배관"이지만, 실제 산출물의
+품질은 **판단을 내리는 에이전트(B/D/F/G)의 프롬프트가 얼마나 엄격하고 일관된
+기준을 갖고 있는가**에 좌우된다. 기준이 느슨하면 문제 있는 콘텐츠가 그대로
+통과하고(과소 반려), 기준이 애매하게 엄격하면 멀쩡한 콘텐츠도 재시도 한도만
+소모하다 사람 검토로 넘어간다(과다 반려). 그래서 프롬프트는 코드와 분리된
+버전 관리 대상으로 취급한다.
+
+### 6.1 코드와 프롬프트 분리
+
+- 프롬프트는 `src/prompts/{agent_name}.md`로 별도 파일화하고, 에이전트 코드는
+  이 파일을 로드해 변수만 채워 넣는다. 프롬프트 튜닝 시 Python 코드를 건드릴
+  필요가 없게 하기 위함.
+- `style_guide`(브랜드 톤/컬러/타깃 독자) 같이 여러 에이전트(C/E/F/G)가 공통으로
+  참조하는 내용은 `_shared/` 블록으로 분리해 한 곳만 고치면 전체에 반영되게 한다.
+
+### 6.2 모든 프롬프트가 따르는 공통 템플릿
+
+```
+# Role
+(이 에이전트가 무엇인지, 파이프라인에서의 위치)
+
+# Inputs
+(어떤 상태 필드가 주입되는지 — 예: fact_sheet, draft, style_guide)
+
+# Task
+(수행할 작업을 단계별로 명시. "알아서 잘 써줘" 금지, 구체적 절차로 분해)
+
+# Rubric / Checklist   ← judge 에이전트(B/D/F/G)에 특히 중요
+(통과/반려를 가르는 기준을 체크리스트로 명문화. "좋은지 판단하라" 같은
+ 애매한 지시가 아니라 "다음 항목을 모두 확인하고 하나라도 위반하면 fail")
+
+# Output Schema
+(Pydantic 모델과 1:1 매핑되는 JSON 스키마. 반려 시 사유(reason)와
+ 다음 에이전트가 참고할 구체적 수정 지시(feedback)를 반드시 포함)
+
+# Examples (few-shot)
+(judge 에이전트는 pass 예시 1개 + fail 예시 1개를 넣어 판정 기준을 보정)
+
+# Constraints
+(하지 말아야 할 것: 예 — 확인 안 된 사실을 단정적으로 쓰지 말 것 등)
+```
+
+### 6.3 Judge 에이전트(B/D/F/G) 프롬프트 원칙
+
+1. **판정 기준을 수치/체크리스트로 명문화**한다. 예: B는 "동일 주장을 뒷받침하는
+   독립 출처가 2개 이상이면 confidence 상향, 1개면 유지, 0개면 rejected".
+2. **이지선다(pass/fail)만 반환하지 않는다.** 반려 시 사유와, 반려받는 에이전트가
+   그대로 사용할 수 있는 구체적 수정 지시를 같이 출력해야 재작업 루프가 의미 있다.
+3. **few-shot pass/fail 예시로 기준을 보정(calibration)**한다. 특히 F(조합 검증)처럼
+   "무엇을 fault로 볼지"가 모델마다 편차가 큰 판단은 예시 없이는 일관성이 떨어진다.
+4. **배포 후 실제 통과율을 로깅**해 너무 관대하거나(문제 있는 콘텐츠가 자주 통과)
+   너무 엄격한지(재시도만 반복) 확인하고 rubric을 조정한다.
+
+### 6.4 예시 스켈레톤
+
+**`prompts/verifier.md` (B — 자료검증)**
+```
+# Role
+너는 수집된 자료의 사실관계를 검증하는 팩트체커다.
+
+# Inputs
+- raw_sources: [{url, title, snippet, raw_text, fetched_at}]
+- topic: str
+
+# Task
+1. raw_sources에서 topic과 관련된 핵심 주장(claim)들을 추출한다.
+2. 각 claim에 대해 독립적인 출처가 몇 개나 이를 뒷받침하는지 확인한다.
+3. 아래 confidence 규칙에 따라 각 claim을 채점한다.
+
+# Rubric
+- 독립 출처 2개 이상 일치 + 최근 1년 이내 게시 → confidence = "high"
+- 독립 출처 1개만 존재, 또는 출처가 오래됨(1년 초과) → confidence = "medium"
+- 뒷받침 출처 없음, 또는 출처끼리 상충 → confidence = "low" (claim 폐기)
+- claim의 60% 이상이 "low"면 verify_report.pass = false
+
+# Output Schema (JSON)
+{
+  "claims": [{"claim": str, "sources": [url], "confidence": "high"|"medium"|"low"}],
+  "rejected_sources": [{"url": str, "reason": str}],
+  "pass": bool,
+  "reason": str,           // pass=false일 때 왜 반려했는지
+  "feedback_for_collector": str | null  // pass=false일 때 재수집 시 참고할 지시
+}
+
+# Constraints
+- 출처에 없는 내용을 추론해서 claim으로 만들지 말 것.
+```
+
+**`prompts/supervisor.md` (G — 총괄 검수)**
+```
+# Role
+너는 파이프라인의 최종 게이트키퍼다. 개별 단계는 각자의 기준으로 통과했지만,
+전체적으로 봤을 때 놓친 문제가 없는지 메타 리뷰한다.
+
+# Inputs
+- reviewed_content, image_set, fact_sheet, review_report, alignment_report, style_guide
+
+# Task
+1. 아래 체크리스트를 모두 확인한다.
+2. 하나라도 fail이면 어느 단계로 되돌려야 하는지(fault_stage)를 명시한다.
+
+# Rubric (모두 충족해야 approved=true)
+- [ ] 톤/문체가 style_guide와 일관되는가
+- [ ] 법적/민감 이슈(과장 광고, 저작권, 개인정보)가 없는가
+- [ ] fact_sheet 상 confidence="low"였던 내용이 본문에 단정적으로 남아있지 않은가
+- [ ] 카드뉴스: 슬라이드 수와 이미지 수가 정확히 일치하는가 / 블로그: 대표 이미지 존재하는가
+- [ ] 업로드 대상 플랫폼의 필수 필드(제목, alt text, 해시태그 등)가 모두 채워졌는가
+
+# Output Schema (JSON)
+{
+  "approved": bool,
+  "failed_checks": [str],
+  "fault_stage": "writer"|"editor"|"image_generator"|"alignment_validator"|null,
+  "notes": str
+}
+```
+
+### 6.5 버전 관리 및 회귀 테스트
+
+- 프롬프트 파일에 버전을 명시하고(`<!-- v1.2 -->` 등) 변경 이력을 남긴다.
+- 각 judge 에이전트마다 "입력 → 기대 pass/fail" fixture 셋(예: 의도적으로 사실
+  왜곡을 넣은 draft, 의도적으로 이미지-텍스트가 안 맞는 케이스)을 만들어 두고,
+  프롬프트를 수정할 때마다 이 회귀 셋으로 판정이 여전히 맞는지 확인한다.
+
+## 7. 다음 단계 (구현 시 고려사항)
 
 - 포맷 분기(블로그 vs 카드뉴스)는 `target_format`을 각 에이전트 프롬프트/로직에서
   분기 처리하되, 상태 스키마와 그래프 구조는 공유하는 것을 권장 (완전히 다른
