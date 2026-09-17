@@ -1,0 +1,14 @@
+# API 키 등 민감 정보 (claude/Auto 파이프라인)
+claude/Auto/api_keys.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 파이프라인 실행 결과물 (이미지 등)
+claude/Auto/output/
+
+# OS
+.DS_Store
